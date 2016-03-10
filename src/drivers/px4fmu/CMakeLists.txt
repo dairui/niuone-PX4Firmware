@@ -39,6 +39,8 @@ px4_add_module(
 	SRCS
 		fmu.cpp
 		px4fmu_params.c
+		../../lib/rc/sbus.c
+		../../lib/rc/dsm.c
 	DEPENDS
 		platforms__common
 	)
