@@ -678,6 +678,13 @@ PX4IO::init()
 	    (_max_rc_input < 1)  || (_max_rc_input > 255)) {
 
 		DEVICE_LOG("config read error");
+
+		// ask IO to reboot into bootloader as the failure may
+		// be due to mismatched firmware versions and we want
+		// the startup script to be able to load a new IO
+		// firmware
+		io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_REBOOT_BL, PX4IO_REBOOT_BL_MAGIC);
+
 		mavlink_log_emergency(_mavlink_fd, "[IO] config read fail, abort.");
 		return -1;
 	}
