@@ -313,9 +313,14 @@ mixer_tick(void)
 
 	} else if (mixer_servos_armed && (should_always_enable_pwm
 					  || (r_setup_arming & PX4IO_P_SETUP_ARMING_LOCKDOWN))) {
+                const uint16_t output_mask = r_page_setup[PX4IO_P_SETUP_IGNORE_ARMING];
 		/* set the disarmed servo outputs. */
 		for (unsigned i = 0; i < PX4IO_SERVO_COUNT; i++) {
-			up_pwm_servo_set(i, r_page_servo_disarmed[i]);
+			if ((1 << i) & output_mask) {
+				up_pwm_servo_set(i, r_page_servos[i]);
+			} else {
+				up_pwm_servo_set(i, r_page_servo_disarmed[i]);
+			}
 			/* copy values into reporting register */
 			r_page_servos[i] = r_page_servo_disarmed[i];
 		}
@@ -403,7 +408,7 @@ mixer_callback(uintptr_t handle,
 	}
 
 	/* motor spinup phase - lock throttle to zero */
-	if ((pwm_limit.state == PWM_LIMIT_STATE_RAMP) || (should_arm_nothrottle && !should_arm)) {
+	if (pwm_limit.state == PWM_LIMIT_STATE_RAMP) {
 		if ((control_group == actuator_controls_s::GROUP_INDEX_ATTITUDE ||
 		     control_group == actuator_controls_s::GROUP_INDEX_ATTITUDE_ALTERNATE) &&
 		    control_index == actuator_controls_s::INDEX_THROTTLE) {
