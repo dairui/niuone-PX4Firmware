@@ -164,6 +164,8 @@ MPU9250_mag::MPU9250_mag(MPU9250 *parent, const char *path) :
 	_mag_overruns(perf_alloc(PC_COUNT, "mpu9250_mag_overruns")),
 	_mag_overflows(perf_alloc(PC_COUNT, "mpu9250_mag_overflows")),
 	_mag_duplicates(perf_alloc(PC_COUNT, "mpu9250_mag_duplicates")),
+	_mag_measure(perf_alloc(PC_COUNT, "mpu9250_mag_measure")),
+	_mag_nonzero(perf_alloc(PC_COUNT, "mpu9250_mag_nonzero")),
 	_mag_asa_x(1.0),
 	_mag_asa_y(1.0),
 	_mag_asa_z(1.0),
@@ -195,6 +197,8 @@ MPU9250_mag::~MPU9250_mag()
 	perf_free(_mag_overruns);
 	perf_free(_mag_overflows);
 	perf_free(_mag_duplicates);
+	perf_free(_mag_measure);
+	perf_free(_mag_nonzero);
 }
 
 int
@@ -233,6 +237,7 @@ MPU9250_mag::init()
 	}
 
 out:
+	printf("MPU9250_mag init() -> %d\n", ret);
 	return ret;
 }
 
@@ -249,9 +254,15 @@ bool MPU9250_mag::check_duplicate(uint8_t *mag_data)
 }
 
 void
-MPU9250_mag::measure(struct ak8963_regs data)
+MPU9250_mag::measure(const struct ak8963_regs &data)
 {
 	bool mag_notify = true;
+
+	perf_count(_mag_measure);
+
+	if (data.x || data.y || data.z) {
+		perf_count(_mag_nonzero);
+	}
 
 	if (check_duplicate((uint8_t *)&data.x) && !(data.st1 & 0x02)) {
 		perf_count(_mag_duplicates);
@@ -589,8 +600,6 @@ MPU9250_mag::ak8963_setup(void)
 	int retries = 10;
 
 	// enable the I2C master to slaves on the aux bus
-	uint8_t user_ctrl = _parent->read_reg(MPUREG_USER_CTRL);
-	_parent->write_checked_reg(MPUREG_USER_CTRL, user_ctrl | BIT_I2C_MST_EN);
 	_parent->write_reg(MPUREG_I2C_MST_CTRL, BIT_I2C_MST_P_NSR | BIT_I2C_MST_WAIT_FOR_ES | BITS_I2C_MST_CLOCK_400HZ);
 
 	if (!ak8963_check_id()) {

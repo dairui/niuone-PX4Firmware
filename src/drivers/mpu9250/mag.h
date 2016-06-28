@@ -69,7 +69,7 @@ public:
 protected:
 	friend class MPU9250;
 
-	void measure(struct ak8963_regs data);
+	void measure(const struct ak8963_regs &data);
 	int self_test(void);
 
 private:
@@ -86,6 +86,8 @@ private:
 	perf_counter_t _mag_overruns;
 	perf_counter_t _mag_overflows;
 	perf_counter_t _mag_duplicates;
+	perf_counter_t _mag_measure;
+	perf_counter_t _mag_nonzero;
 	float _mag_asa_x;
 	float _mag_asa_y;
 	float _mag_asa_z;

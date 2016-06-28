@@ -94,6 +94,14 @@
 #define MPUREG_LPACCEL_ODR		0x1E
 #define MPUREG_WOM_THRESH		0x1F
 #define MPUREG_FIFO_EN			0x23
+#define MPUREG_FIFO_EN_BIT_TEMP_EN		0x80
+#define MPUREG_FIFO_EN_BIT_GYRX_EN		0x40
+#define MPUREG_FIFO_EN_BIT_GYRY_EN		0x20
+#define MPUREG_FIFO_EN_BIT_GYRZ_EN		0x10
+#define MPUREG_FIFO_EN_BIT_ACCEL_EN		0x08
+#define MPUREG_FIFO_EN_BIT_SLV2_EN		0x04
+#define MPUREG_FIFO_EN_BIT_SLV1_EN		0x02
+#define MPUREG_FIFO_EN_BIT_SLV0_EN		0x01
 #define MPUREG_I2C_MST_CTRL		0x24
 #define MPUREG_I2C_SLV0_ADDR		0x25
 #define MPUREG_I2C_SLV0_REG		0x26
@@ -139,6 +147,10 @@
 #define MPUREG_SIGNAL_PATH_RESET	0x68
 #define MPUREG_MOT_DETECT_CTRL		0x69
 #define MPUREG_USER_CTRL		0x6A
+#define MPUREG_USER_CTRL_BIT_FIFO_EN		0x40
+#define MPUREG_USER_CTRL_BIT_FIFO_RST		0x04
+#define MPUREG_USER_CTRL_BIT_I2C_MST_EN		0x20
+
 #define MPUREG_PWR_MGMT_1		0x6B
 #define MPUREG_PWR_MGMT_2		0x6C
 #define MPUREG_FIFO_COUNTH		0x72
@@ -190,7 +202,8 @@
   we set the timer interrupt to run a bit faster than the desired
   sample rate and then throw away duplicates by comparing
   accelerometer values. This time reduction is enough to cope with
-  worst case timing jitter due to other timers
+  worst case timing jitter due to other timers. This is not applied
+  when in FIFO mode
  */
 #define MPU9250_TIMER_REDUCTION				200
 
@@ -209,18 +222,21 @@ const uint8_t MPU9250::_checked_registers[MPU9250_NUM_CHECKED_REGISTERS] = { MPU
 									     MPUREG_ACCEL_CONFIG,
 									     MPUREG_ACCEL_CONFIG2,
 									     MPUREG_INT_ENABLE,
-									     MPUREG_INT_PIN_CFG
+									     MPUREG_INT_PIN_CFG,
+									     MPUREG_FIFO_EN,
 									   };
 
 
 MPU9250::MPU9250(int bus, const char *path_accel, const char *path_gyro, const char *path_mag, spi_dev_e device,
-		 enum Rotation rotation) :
+		 enum Rotation rotation, bool use_FIFO, bool use_mag) :
 	SPI("MPU9250", path_accel, bus, device, SPIDEV_MODE3, MPU9250_LOW_BUS_SPEED),
 	_gyro(new MPU9250_gyro(this, path_gyro)),
-	_mag(new MPU9250_mag(this, path_mag)),
+	_mag(use_mag ? new MPU9250_mag(this, path_mag) : nullptr),
 	_whoami(0),
 	_call{},
 	_call_interval(0),
+	_use_FIFO(use_FIFO),
+	_use_mag(use_mag),
 	_accel_reports(nullptr),
 	_accel_scale{},
 	_accel_range_scale(0.0f),
@@ -245,6 +261,7 @@ MPU9250::MPU9250(int bus, const char *path_accel, const char *path_gyro, const c
 	_controller_latency_perf(perf_alloc_once(PC_ELAPSED, "ctrl_latency")),
 	_register_wait(0),
 	_reset_wait(0),
+	_last_mag_measure_us(0),
 	_accel_filter_x(MPU9250_ACCEL_DEFAULT_RATE, MPU9250_ACCEL_DEFAULT_DRIVER_FILTER_FREQ),
 	_accel_filter_y(MPU9250_ACCEL_DEFAULT_RATE, MPU9250_ACCEL_DEFAULT_DRIVER_FILTER_FREQ),
 	_accel_filter_z(MPU9250_ACCEL_DEFAULT_RATE, MPU9250_ACCEL_DEFAULT_DRIVER_FILTER_FREQ),
@@ -257,7 +274,9 @@ MPU9250::MPU9250(int bus, const char *path_accel, const char *path_gyro, const c
 	_checked_next(0),
 	_last_temperature(0),
 	_last_accel_data{},
-	_got_duplicate(false)
+	_got_duplicate(false),
+	_FIFO_stats{},
+	_fifo_data{}
 {
 	// disable debug() calls
 	_debug_enabled = false;
@@ -268,9 +287,11 @@ MPU9250::MPU9250(int bus, const char *path_accel, const char *path_gyro, const c
 	_gyro->_device_id.devid = _device_id.devid;
 	_gyro->_device_id.devid_s.devtype = DRV_GYR_DEVTYPE_MPU9250;
 
-	/* Prime _mag with parents devid. */
-	_mag->_device_id.devid = _device_id.devid;
-	_mag->_device_id.devid_s.devtype = DRV_MAG_DEVTYPE_MPU9250;
+	if (_mag != nullptr) {
+		/* Prime _mag with parents devid. */
+		_mag->_device_id.devid = _device_id.devid;
+		_mag->_device_id.devid_s.devtype = DRV_MAG_DEVTYPE_MPU9250;
+	}
 
 	// default accel scale factors
 	_accel_scale.x_offset = 0;
@@ -300,7 +321,9 @@ MPU9250::~MPU9250()
 	delete _gyro;
 
 	/* delete the magnetometer subdriver */
-	delete _mag;
+	if (_mag != nullptr) {
+		delete _mag;
+	}
 
 	/* free any existing reports */
 	if (_accel_reports != nullptr) {
@@ -324,6 +347,18 @@ MPU9250::~MPU9250()
 	perf_free(_good_transfers);
 	perf_free(_reset_retries);
 	perf_free(_duplicates);
+}
+
+void
+MPU9250::reset_FIFO(void)
+{
+	if (_mag != nullptr) {
+		write_reg(MPUREG_USER_CTRL, MPUREG_USER_CTRL_BIT_FIFO_EN | MPUREG_USER_CTRL_BIT_FIFO_RST |
+			  MPUREG_USER_CTRL_BIT_I2C_MST_EN);
+
+	} else {
+		write_reg(MPUREG_USER_CTRL, MPUREG_USER_CTRL_BIT_FIFO_EN | MPUREG_USER_CTRL_BIT_FIFO_RST);
+	}
 }
 
 int
@@ -388,8 +423,16 @@ MPU9250::init()
 		return ret;
 	}
 
-	/* do CDev init for the mag device node, keep it optional */
-	ret = _mag->init();
+	if (_mag != nullptr) {
+		/* do CDev init for the mag device node, keep it optional */
+		ret = _mag->init();
+	}
+
+	//print_registers();
+
+	if (_use_FIFO) {
+		reset_FIFO();
+	}
 
 	/* if probe/setup failed, bail now */
 	if (ret != OK) {
@@ -398,6 +441,8 @@ MPU9250::init()
 	}
 
 	_accel_class_instance = register_class_devname(ACCEL_BASE_DEVICE_PATH);
+
+	//print_registers();
 
 	measure();
 
@@ -471,6 +516,23 @@ int MPU9250::reset()
 	write_checked_reg(MPUREG_INT_PIN_CFG, BIT_INT_ANYRD_2CLEAR); // INT: Clear on any read
 	usleep(1000);
 
+	uint8_t i2c_enable_bits = _mag ? MPUREG_USER_CTRL_BIT_I2C_MST_EN : 0;
+
+	if (_use_FIFO) {
+		write_reg(MPUREG_USER_CTRL, MPUREG_USER_CTRL_BIT_FIFO_EN | MPUREG_USER_CTRL_BIT_FIFO_RST);
+		write_checked_reg(MPUREG_USER_CTRL, MPUREG_USER_CTRL_BIT_FIFO_EN | i2c_enable_bits);
+		write_checked_reg(MPUREG_FIFO_EN,
+				  MPUREG_FIFO_EN_BIT_TEMP_EN |
+				  MPUREG_FIFO_EN_BIT_GYRX_EN |
+				  MPUREG_FIFO_EN_BIT_GYRY_EN |
+				  MPUREG_FIFO_EN_BIT_GYRZ_EN |
+				  MPUREG_FIFO_EN_BIT_ACCEL_EN);
+
+	} else {
+		write_checked_reg(MPUREG_USER_CTRL, i2c_enable_bits);
+		write_checked_reg(MPUREG_FIFO_EN, 0);
+	}
+
 	uint8_t retries = 10;
 
 	while (retries--) {
@@ -487,6 +549,8 @@ int MPU9250::reset()
 			break;
 		}
 	}
+
+	//print_registers();
 
 	return OK;
 }
@@ -521,6 +585,19 @@ MPU9250::_set_sample_rate(unsigned desired_sample_rate_hz)
 	    desired_sample_rate_hz == GYRO_SAMPLERATE_DEFAULT ||
 	    desired_sample_rate_hz == ACCEL_SAMPLERATE_DEFAULT) {
 		desired_sample_rate_hz = MPU9250_GYRO_DEFAULT_RATE;
+	}
+
+	if (desired_sample_rate_hz >= 4000 && !_use_FIFO) {
+		// can't do high rates without FIFO
+		desired_sample_rate_hz = 1000;
+	}
+
+	if (desired_sample_rate_hz >= 4000) {
+		// special handling for high rate
+		_sample_rate = 8000;
+		write_checked_reg(MPUREG_SMPLRT_DIV, 0);
+		write_checked_reg(MPUREG_ACCEL_CONFIG2, 0x08);
+		return;
 	}
 
 	uint8_t div = 1000 / desired_sample_rate_hz;
@@ -849,9 +926,15 @@ MPU9250::ioctl(struct file *filp, int cmd, unsigned long arg)
 					  set call interval faster than the sample time. We
 					  then detect when we have duplicate samples and reject
 					  them. This prevents aliasing due to a beat between the
-					  stm32 clock and the mpu9250 clock
+					  stm32 clock and the mpu9250 clock. Not applied
+					  in FIFO mode
 					 */
-					_call.period = _call_interval - MPU9250_TIMER_REDUCTION;
+					if (_use_FIFO) {
+						_call.period = _call_interval;
+
+					} else {
+						_call.period = _call_interval - MPU9250_TIMER_REDUCTION;
+					}
 
 					/* if we need to start the poll state machine, do it */
 					if (want_start) {
@@ -1060,12 +1143,12 @@ MPU9250::read_reg(unsigned reg, uint32_t speed)
 }
 
 uint16_t
-MPU9250::read_reg16(unsigned reg)
+MPU9250::read_reg16(unsigned reg, uint32_t speed)
 {
 	uint8_t cmd[3] = { (uint8_t)(reg | DIR_READ), 0, 0 };
 
 	// general register transfer at low clock speed
-	set_frequency(MPU9250_LOW_BUS_SPEED);
+	set_frequency(speed);
 
 	transfer(cmd, cmd, sizeof(cmd));
 
@@ -1154,12 +1237,15 @@ MPU9250::start()
 	/* discard any stale data in the buffers */
 	_accel_reports->flush();
 	_gyro_reports->flush();
-	_mag->_mag_reports->flush();
+
+	if (_mag != nullptr) {
+		_mag->_mag_reports->flush();
+	}
 
 	/* start polling at the specified rate */
 	hrt_call_every(&_call,
 		       1000,
-		       _call_interval - MPU9250_TIMER_REDUCTION,
+		       _use_FIFO ? _call_interval : _call_interval - MPU9250_TIMER_REDUCTION,
 		       (hrt_callout)&MPU9250::measure_trampoline, this);
 }
 
@@ -1212,6 +1298,7 @@ MPU9250::check_registers(void)
 		if (_register_wait == 0 || _checked_next == 0) {
 			// if the product_id is wrong then reset the
 			// sensor completely
+			printf("[0] sensor reset\n");
 			write_reg(MPUREG_PWR_MGMT_1, BIT_H_RESET);
 			write_reg(MPUREG_PWR_MGMT_2, MPU_CLK_SEL_AUTO);
 			// after doing a reset we need to wait a long
@@ -1280,16 +1367,10 @@ bool MPU9250::check_duplicate(uint8_t *accel_data)
 	return _got_duplicate;
 }
 
+
 void
-MPU9250::measure()
+MPU9250::process_sample(const struct MPUReport_data &mpu_report)
 {
-	if (hrt_absolute_time() < _reset_wait) {
-		// we're waiting for a reset to complete
-		return;
-	}
-
-	struct MPUReport mpu_report;
-
 	struct Report {
 		int16_t		accel_x;
 		int16_t		accel_y;
@@ -1299,29 +1380,6 @@ MPU9250::measure()
 		int16_t		gyro_y;
 		int16_t		gyro_z;
 	} report;
-
-	/* start measuring */
-	perf_begin(_sample_perf);
-
-	/*
-	 * Fetch the full set of measurements from the MPU9250 in one pass.
-	 */
-	mpu_report.cmd = DIR_READ | MPUREG_INT_STATUS;
-
-	// sensor transfer at high clock speed
-	set_frequency(MPU9250_HIGH_BUS_SPEED);
-
-	if (OK != transfer((uint8_t *)&mpu_report, ((uint8_t *)&mpu_report), sizeof(mpu_report))) {
-		return;
-	}
-
-	check_registers();
-
-	if (check_duplicate(&mpu_report.accel_x[0])) {
-		return;
-	}
-
-	_mag->measure(mpu_report.mag);
 
 	/*
 	 * Convert from big to little endian
@@ -1493,6 +1551,133 @@ MPU9250::measure()
 }
 
 void
+MPU9250::measure_direct()
+{
+	struct MPUReport mpu_report;
+
+	/*
+	 * Fetch the full set of measurements from the MPU9250 in one pass.
+	 */
+	mpu_report.cmd = DIR_READ | MPUREG_ACCEL_XOUT_H;
+
+	// sensor transfer at high clock speed
+	set_frequency(MPU9250_HIGH_BUS_SPEED);
+
+	if (OK != transfer((uint8_t *)&mpu_report, ((uint8_t *)&mpu_report), sizeof(mpu_report))) {
+		return;
+	}
+
+	check_registers();
+
+	if (check_duplicate(&mpu_report.data.accel_x[0])) {
+		return;
+	}
+
+	process_sample(mpu_report.data);
+}
+
+void
+MPU9250::measure_mag()
+{
+	struct MAGReport mag_report;
+
+	/*
+	 * Fetch the mag data from AK8963
+	 */
+	mag_report.cmd = DIR_READ | MPUREG_EXT_SENS_DATA_00;
+
+	// sensor transfer at high clock speed
+	set_frequency(MPU9250_HIGH_BUS_SPEED);
+
+	if (OK != transfer((uint8_t *)&mag_report, ((uint8_t *)&mag_report), sizeof(mag_report))) {
+		return;
+	}
+
+	if (_mag != nullptr) {
+		_mag->measure(mag_report.data);
+	}
+}
+
+
+void
+MPU9250::measure_FIFO()
+{
+	uint16_t fifo_count;
+
+	uint64_t now = hrt_absolute_time();
+
+	if (_FIFO_stats.last_measure_info_us != 0) {
+		_FIFO_stats.time_count++;
+		_FIFO_stats.time_accum += (now - _FIFO_stats.last_measure_info_us);
+	}
+
+	_FIFO_stats.last_measure_info_us = now;
+
+	fifo_count = read_reg16(MPUREG_FIFO_COUNTH, MPU9250_HIGH_BUS_SPEED);
+	uint16_t sample_count = fifo_count / sizeof(struct MPUReport_data);
+
+	if (sample_count > fifo_max_samples) {
+		printf("fifo_count %u %u\n",
+		       (unsigned)fifo_count, (unsigned)sizeof(struct MPUReport_data));
+		reset_FIFO();
+		return;
+	}
+
+	_fifo_data.cmd = DIR_READ | MPUREG_FIFO_R_W;
+
+	if (OK != transfer((uint8_t *)&_fifo_data, ((uint8_t *)&_fifo_data),
+			   1 + sample_count * sizeof(struct MPUReport_data))) {
+		return;
+	}
+
+	_FIFO_stats.samples += sample_count;
+
+	static struct MPUReport_data last_data;
+
+	for (uint8_t i = 0; i < sample_count; i++) {
+		process_sample(_fifo_data.data[i]);
+
+		if (memcmp(&last_data.accel_x[0], &_fifo_data.data[i].accel_x[0], 6) != 0) {
+			_FIFO_stats.new_accel++;
+		}
+
+		last_data = _fifo_data.data[i];
+	}
+}
+
+void
+MPU9250::measure()
+{
+	if (hrt_absolute_time() < _reset_wait) {
+		// we're waiting for a reset to complete
+		return;
+	}
+
+	/* start measuring */
+	perf_begin(_sample_perf);
+
+	if (_use_FIFO) {
+		measure_FIFO();
+
+	} else {
+		measure_direct();
+	}
+
+	if (_mag != nullptr) {
+		// read from mag at 100Hz
+		uint64_t now = hrt_absolute_time();
+
+		if (now - _last_mag_measure_us >= 10000U) {
+			measure_mag();
+			_last_mag_measure_us = now;
+		}
+	}
+
+	/* stop measuring */
+	perf_end(_sample_perf);
+}
+
+void
 MPU9250::print_info()
 {
 	perf_print_counter(_sample_perf);
@@ -1503,9 +1688,24 @@ MPU9250::print_info()
 	perf_print_counter(_good_transfers);
 	perf_print_counter(_reset_retries);
 	perf_print_counter(_duplicates);
+
+	if (_mag != nullptr) {
+		perf_print_counter(_mag->_mag_reads);
+		perf_print_counter(_mag->_mag_measure);
+		perf_print_counter(_mag->_mag_errors);
+		perf_print_counter(_mag->_mag_overruns);
+		perf_print_counter(_mag->_mag_overflows);
+		perf_print_counter(_mag->_mag_duplicates);
+		perf_print_counter(_mag->_mag_nonzero);
+	}
+
 	_accel_reports->print_info("accel queue");
 	_gyro_reports->print_info("gyro queue");
-	_mag->_mag_reports->print_info("mag queue");
+
+	if (_mag != nullptr) {
+		_mag->_mag_reports->print_info("mag queue");
+	}
+
 	::printf("checked_next: %u\n", _checked_next);
 
 	for (uint8_t i = 0; i < MPU9250_NUM_CHECKED_REGISTERS; i++) {
@@ -1527,6 +1727,16 @@ MPU9250::print_info()
 	}
 
 	::printf("temperature: %.1f\n", (double)_last_temperature);
+
+	if (_use_FIFO) {
+		struct FIFO_stats s = _FIFO_stats;
+		memset(&_FIFO_stats, 0, sizeof(_FIFO_stats));
+		float avg_t = (s.time_accum / s.time_count) * 1.0e-6f;
+		printf("avg_samples=%.2f avg_time=%u avg_accel=%.2f\n",
+		       s.samples / (s.time_count * avg_t),
+		       (unsigned)(avg_t * 1000 * 1000),
+		       s.new_accel / (s.time_count * avg_t));
+	}
 }
 
 void
@@ -1534,7 +1744,7 @@ MPU9250::print_registers()
 {
 	printf("MPU9250 registers\n");
 
-	for (uint8_t reg = 0; reg <= 126; reg++) {
+	for (uint8_t reg = 0; reg < MPUREG_FIFO_R_W; reg++) {
 		uint8_t v = read_reg(reg);
 		printf("%02x:%02x ", (unsigned)reg, (unsigned)v);
 

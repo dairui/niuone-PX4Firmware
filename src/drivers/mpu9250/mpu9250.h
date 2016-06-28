@@ -21,7 +21,7 @@ class MPU9250 : public device::SPI
 {
 public:
 	MPU9250(int bus, const char *path_accel, const char *path_gyro, const char *path_mag, spi_dev_e device,
-		enum Rotation rotation);
+		enum Rotation rotation, bool use_FIFO, bool use_mag);
 	virtual ~MPU9250();
 
 	virtual int		init();
@@ -56,6 +56,9 @@ private:
 	struct hrt_call		_call;
 	unsigned		_call_interval;
 
+	bool			_use_FIFO;
+	bool			_use_mag;
+
 	ringbuffer::RingBuffer	*_accel_reports;
 
 	struct accel_calibration_s	_accel_scale;
@@ -86,6 +89,7 @@ private:
 
 	uint8_t			_register_wait;
 	uint64_t		_reset_wait;
+	uint64_t		_last_mag_measure_us;
 
 	math::LowPassFilter2p	_accel_filter_x;
 	math::LowPassFilter2p	_accel_filter_y;
@@ -102,7 +106,7 @@ private:
 	// this is used to support runtime checking of key
 	// configuration registers to detect SPI bus errors and sensor
 	// reset
-#define MPU9250_NUM_CHECKED_REGISTERS 11
+#define MPU9250_NUM_CHECKED_REGISTERS 12
 	static const uint8_t	_checked_registers[MPU9250_NUM_CHECKED_REGISTERS];
 	uint8_t			_checked_values[MPU9250_NUM_CHECKED_REGISTERS];
 	uint8_t			_checked_bad[MPU9250_NUM_CHECKED_REGISTERS];
@@ -116,6 +120,14 @@ private:
 	// keep last accel reading for duplicate detection
 	uint8_t			_last_accel_data[6];
 	bool			_got_duplicate;
+
+	struct FIFO_stats {
+		uint64_t last_measure_info_us;
+		uint64_t time_accum;
+		uint32_t time_count;
+		uint32_t new_accel;
+		uint32_t samples;
+	} _FIFO_stats;
 
 	/**
 	 * Start automatic measurement.
@@ -146,6 +158,21 @@ private:
 	static void		measure_trampoline(void *arg);
 
 	/**
+	 * Fetch measurements from the sensor and update the report buffers. Use direct register reads
+	 */
+	void			measure_direct();
+
+	/**
+	 * Fetch measurements from the sensor and update the report buffers. Use FIFO read
+	 */
+	void			measure_FIFO();
+
+	/**
+	 * Fetch measurements from the mag update the report buffers. Use direct register reads
+	 */
+	void			measure_mag();
+
+	/**
 	 * Fetch measurements from the sensor and update the report buffers.
 	 */
 	void			measure();
@@ -157,7 +184,7 @@ private:
 	 * @return		The value that was read.
 	 */
 	uint8_t			read_reg(unsigned reg, uint32_t speed = MPU9250_LOW_BUS_SPEED);
-	uint16_t		read_reg16(unsigned reg);
+	uint16_t		read_reg16(unsigned reg, uint32_t speed = MPU9250_LOW_BUS_SPEED);
 
 	/**
 	 * Write a register in the mpu
@@ -242,6 +269,11 @@ private:
 	 */
 	void check_registers(void);
 
+	/*
+	  reset FIFO
+	*/
+	void reset_FIFO(void);
+
 	/* do not allow to copy this class due to pointer data members */
 	MPU9250(const MPU9250 &);
 	MPU9250 operator=(const MPU9250 &);
@@ -251,9 +283,7 @@ private:
 	 * Report conversation within the mpu, including command byte and
 	 * interrupt status.
 	 */
-	struct MPUReport {
-		uint8_t		cmd;
-		uint8_t		status;
+	struct MPUReport_data {
 		uint8_t		accel_x[2];
 		uint8_t		accel_y[2];
 		uint8_t		accel_z[2];
@@ -261,7 +291,30 @@ private:
 		uint8_t		gyro_x[2];
 		uint8_t		gyro_y[2];
 		uint8_t		gyro_z[2];
-		struct ak8963_regs mag;
+	};
+
+	struct MPUReport {
+		uint8_t			cmd;
+		struct MPUReport_data	data;
+	};
+
+	static const unsigned fifo_max_samples = 20;
+	struct MPUReport_FIFO {
+		uint8_t			cmd;
+		struct MPUReport_data	data[fifo_max_samples];
+	};
+
+	struct MAGReport {
+		uint8_t			cmd;
+		struct ak8963_regs		data;
 	};
 #pragma pack(pop)
+
+	// allocate fifo data on heap to prevent excessive stack usage
+	struct MPUReport_FIFO		_fifo_data;
+
+	/**
+	 * process one sample from the sensor
+	 */
+	void			process_sample(const struct MPUReport_data &mpu_report);
 };

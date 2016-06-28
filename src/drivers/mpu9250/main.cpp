@@ -53,6 +53,8 @@
 #include <stdio.h>
 #include <getopt.h>
 
+#include <nuttx/arch.h>
+
 #include <systemlib/perf_counter.h>
 #include <systemlib/err.h>
 #include <systemlib/conversions.h>
@@ -92,7 +94,7 @@ namespace mpu9250
 MPU9250	*g_dev_int; // on internal bus
 MPU9250	*g_dev_ext; // on external bus
 
-void	start(bool, enum Rotation);
+void	start(bool, enum Rotation, bool use_FIFO, bool use_mag);
 void	stop(bool);
 void	test(bool);
 void	reset(bool);
@@ -108,7 +110,7 @@ void	usage();
  * or failed to detect the sensor.
  */
 void
-start(bool external_bus, enum Rotation rotation)
+start(bool external_bus, enum Rotation rotation, bool use_FIFO, bool use_mag)
 {
 	int fd;
 	MPU9250 **g_dev_ptr = external_bus ? &g_dev_ext : &g_dev_int;
@@ -125,13 +127,15 @@ start(bool external_bus, enum Rotation rotation)
 	/* create the driver */
 	if (external_bus) {
 #ifdef PX4_SPI_BUS_EXT
-		*g_dev_ptr = new MPU9250(PX4_SPI_BUS_EXT, path_accel, path_gyro, path_mag, (spi_dev_e)PX4_SPIDEV_EXT_MPU, rotation);
+		*g_dev_ptr = new MPU9250(PX4_SPI_BUS_EXT, path_accel, path_gyro, path_mag, (spi_dev_e)PX4_SPIDEV_EXT_MPU, rotation,
+					 use_FIFO, use_mag);
 #else
 		errx(0, "External SPI not available");
 #endif
 
 	} else {
-		*g_dev_ptr = new MPU9250(PX4_SPI_BUS_SENSORS, path_accel, path_gyro, path_mag, (spi_dev_e)PX4_SPIDEV_MPU, rotation);
+		*g_dev_ptr = new MPU9250(PX4_SPI_BUS_SENSORS, path_accel, path_gyro, path_mag, (spi_dev_e)PX4_SPIDEV_MPU, rotation,
+					 use_FIFO, use_mag);
 	}
 
 	if (*g_dev_ptr == nullptr) {
@@ -220,13 +224,16 @@ test(bool external_bus)
 		err(1, "%s open failed", path_mag);
 	}
 
-	/* reset to manual polling */
-	if (ioctl(fd, SENSORIOCSPOLLRATE, SENSOR_POLLRATE_MANUAL) < 0) {
-		err(1, "reset to manual polling");
-	}
+	/* wait for a successful read */
+	uint16_t tries = 100;
 
-	/* do a simple demand read */
-	sz = read(fd, &a_report, sizeof(a_report));
+	do {
+		sz = read(fd, &a_report, sizeof(a_report));
+
+		if (sz != sizeof(a_report)) {
+			up_udelay(500);
+		}
+	} while (sz != sizeof(a_report) && tries--);
 
 	if (sz != sizeof(a_report)) {
 		warnx("ret: %d, expected: %d", sz, sizeof(a_report));
@@ -244,8 +251,16 @@ test(bool external_bus)
 	warnx("acc range: %8.4f m/s^2 (%8.4f g)", (double)a_report.range_m_s2,
 	      (double)(a_report.range_m_s2 / MPU9250_ONE_G));
 
-	/* do a simple demand read */
-	sz = read(fd_gyro, &g_report, sizeof(g_report));
+	/* wait for a successful read */
+	tries = 100;
+
+	do {
+		sz = read(fd_gyro, &g_report, sizeof(g_report));
+
+		if (sz != sizeof(g_report)) {
+			up_udelay(500);
+		}
+	} while (sz != sizeof(g_report) && tries--);
 
 	if (sz != sizeof(g_report)) {
 		warnx("ret: %d, expected: %d", sz, sizeof(g_report));
@@ -281,18 +296,11 @@ test(bool external_bus)
 	warnx("mag range: %8.4f Ga", (double)m_report.range_ga);
 	warnx("mag temp:  %8.4f\tdeg celsius", (double)m_report.temperature);
 
-	/* reset to default polling */
-	if (ioctl(fd, SENSORIOCSPOLLRATE, SENSOR_POLLRATE_DEFAULT) < 0) {
-		err(1, "reset to default polling");
-	}
-
 	close(fd);
 	close(fd_gyro);
 	close(fd_mag);
 
 	/* XXX add poll-rate tests here too */
-
-	reset(external_bus);
 	errx(0, "PASS");
 }
 
@@ -380,6 +388,8 @@ usage()
 	warnx("options:");
 	warnx("    -X    (external bus)");
 	warnx("    -R rotation");
+	warnx("    -F    (use FIFO)");
+	warnx("    -M    (enable magnetometer)");
 }
 
 } // namespace
@@ -390,9 +400,11 @@ mpu9250_main(int argc, char *argv[])
 	bool external_bus = false;
 	int ch;
 	enum Rotation rotation = ROTATION_NONE;
+	bool use_FIFO = false;
+	bool use_mag = false;
 
 	/* jump over start/off/etc and look at options first */
-	while ((ch = getopt(argc, argv, "XR:")) != EOF) {
+	while ((ch = getopt(argc, argv, "XR:FM")) != EOF) {
 		switch (ch) {
 		case 'X':
 			external_bus = true;
@@ -400,6 +412,20 @@ mpu9250_main(int argc, char *argv[])
 
 		case 'R':
 			rotation = (enum Rotation)atoi(optarg);
+			break;
+
+		case 'F':
+			use_FIFO = true;
+			break;
+
+		case 'M':
+			/* the mag is optional as using the mag limits
+			 * the sample rate on the accels and gyros to
+			 * 2669Hz. It seems that the sensor can't keep
+			 * up with both the I2C traffic and the
+			 * accel/gyro traffic at full rate
+			 */
+			use_mag = true;
 			break;
 
 		default:
@@ -414,7 +440,7 @@ mpu9250_main(int argc, char *argv[])
 	 * Start/load the driver.
 	 */
 	if (!strcmp(verb, "start")) {
-		mpu9250::start(external_bus, rotation);
+		mpu9250::start(external_bus, rotation, use_FIFO, use_mag);
 	}
 
 	if (!strcmp(verb, "stop")) {
