@@ -43,7 +43,7 @@
 #include "conversions.h"
 
 int16_t
-int16_t_from_bytes(uint8_t bytes[])
+int16_t_from_bytes(const uint8_t bytes[])
 {
 	union {
 		uint8_t    b[2];

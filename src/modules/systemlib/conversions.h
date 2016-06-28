@@ -54,7 +54,7 @@ __BEGIN_DECLS
  * Common vendors with big endian representation are Invense, Bosch and
  * Honeywell. ST micro devices tend to use a little endian representation.
  */
-__EXPORT int16_t int16_t_from_bytes(uint8_t bytes[]);
+__EXPORT int16_t int16_t_from_bytes(const uint8_t bytes[]);
 
 __END_DECLS
 
